@@ -23,9 +23,11 @@
     flux-tml bans / unban <name|ip>    the ban list
     flux-tml restart                   save, stop and start again (applies the above)
 
-Settings, mods and configs changed by the panel are applied on the NEXT start. Precedence, the same
-everywhere: an environment variable that is SET (even to "") is applied on every start; one that is
-not set leaves the panel's value, and then the default.
+Settings, mods and configs changed by the panel are applied on the NEXT start. Precedence: an
+environment variable that is SET is applied on every start; one that is not set leaves the panel's
+value, and then the default. Two exceptions: the size, difficulty and seed of a NEW world, where the
+panel's choice wins (the environment is the default); and an EMPTY MOTD, password or seed variable,
+which counts as unset.
 """
 
 import json
@@ -144,8 +146,19 @@ def load_settings():
     return data if isinstance(data, dict) else {}
 
 
+# The size, difficulty and seed of a NEW world: the environment is the deploy's DEFAULT, and a
+# world created from the panel with its own choices gets those (the spec always sets the first
+# two, so env-first would make the panel's New World form do nothing).
+NEW_WORLD_KEYS = ("worldSize", "difficulty", "seed")
+# Keys whose empty value means "none": an empty variable (the marketplace writes the declared ones
+# even when left blank) leaves the panel's value instead of erasing it.
+EMPTY_IS_UNSET = ("motd", "password", "seed")
+
+
 def effective(settings, env_name, key, default=None):
-    if env_name in os.environ:
+    if key in NEW_WORLD_KEYS and key in settings:
+        return settings[key], "panel"
+    if env_name in os.environ and not (key in EMPTY_IS_UNSET and not str(os.environ[env_name]).strip()):
         return os.environ[env_name], "env"
     if key in settings:
         return settings[key], "panel"

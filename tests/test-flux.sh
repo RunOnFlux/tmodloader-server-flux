@@ -72,7 +72,15 @@ check "the panel's world, as a plain name" "${data}/Worlds/Other World.wld" "$(c
 check "the panel's password" "pw" "$(cfgval password)"
 check "the motd" "hi" "$(cfgval motd)"
 tml TML_PASSWORD="" apply >/dev/null
-check "a SET empty env password wins over the panel" "" "$(cfgval password)"
+check "an EMPTY env password leaves the panel's (empty counts as unset)" "pw" "$(cfgval password)"
+tml TML_PASSWORD="envpw" apply >/dev/null
+check "a set env password wins over the panel" "envpw" "$(cfgval password)"
+check "an empty env MOTD leaves the panel's" "hi" "$(tml TML_MOTD="" apply >/dev/null; cfgval motd)"
+rm -f "${data}/Worlds/Other World.wld"
+tml set-settings '{"worldSize": "small", "difficulty": "master"}' >/dev/null
+tml TML_WORLD_SIZE=large TML_DIFFICULTY=classic apply >/dev/null
+check "a new world from the panel keeps its own size and difficulty" "1 2" "$(cfgval autocreate) $(cfgval difficulty)"
+tml set-settings '{"worldSize": null, "difficulty": null}' >/dev/null
 check "a bad size is refused" "2" "$(status tml set-settings '{"worldSize": "huge"}')"
 check "a bad difficulty is refused" "2" "$(status tml set-settings '{"difficulty": "nightmare"}')"
 check "an unknown setting is refused" "2" "$(status tml set-settings '{"pvp": 1}')"

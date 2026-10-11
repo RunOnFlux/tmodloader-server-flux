@@ -34,8 +34,10 @@ server through its console.
 
 ## Environment
 
-A variable that is **set** (even to `""`) is applied on every start; one that is not set leaves
-the panel's value (`flux/settings.json`), and then the default.
+A variable that is **set** is applied on every start; one that is not set leaves the panel's
+value (`flux/settings.json`), and then the default. Two exceptions: the size, difficulty and seed of
+a **new** world, where the panel's New World choice wins (the variables are the default); and an
+**empty** `TML_MOTD`, `TML_PASSWORD` or `TML_SEED`, which counts as unset.
 
 | Variable | | |
 |---|---|---|
@@ -88,4 +90,7 @@ then exit 42).
 
 ## Versions
 
+- **1.0.1** (2026-10-11): a new world made from the panel keeps its own size, difficulty and seed
+  (the spec's variables are the default); an empty MOTD, password or seed variable no longer
+  erases the panel's.
 - **1.0.0** (2026-10-11): first release.
