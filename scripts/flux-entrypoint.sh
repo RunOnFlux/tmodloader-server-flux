@@ -4,10 +4,12 @@
 # The game runs as a CHILD, never exec, so a stop reaches us first and becomes a save, and a
 # server that ends on its own is followed by the next one in place:
 #
-#   - every start: the tModLoader build TML_VERSION names (GitHub releases, no Steam login), the
-#     Workshop mods and every mod they require (SteamCMD, anonymous), Mods/enabled.json, a backup of
-#     the worlds, serverconfig.txt from the environment and the panel, then the server, with its
-#     console on a FIFO the supervisor holds open
+#   - every start: a restore the panel asked for (fluxtml.py do-restore), the tModLoader build
+#     TML_VERSION names (GitHub releases, no Steam login), the Workshop mods and every mod they
+#     require (SteamCMD, anonymous), Mods/enabled.json, a backup of the worlds (skipped when the
+#     newest is under an hour old), serverconfig.txt from the environment and the panel, then the
+#     server, with its console on a FIFO the supervisor holds open
+#   - an update that could not be installed is not tried again for FLUX_UPDATE_RETRY_HOURS
 #   - while it runs: `save` every TML_AUTOSAVE_MINUTES; a newer tModLoader (stable/preview) or a
 #     mod updated on the Workshop restarts it onto the new files, players warned in chat first
 #   - TML_RESTART_TIME: a daily restart at that time, players warned in chat first
@@ -27,7 +29,8 @@ FLUX_RESTART_WINDOW="${FLUX_RESTART_WINDOW:-3600}"
 FLUX_RESTART_BACKOFF="${FLUX_RESTART_BACKOFF:-10}"
 FLUX_STOP_GRACE="${FLUX_STOP_GRACE:-90}"
 FLUX_BACKUP_HOURS="${FLUX_BACKUP_HOURS:-6}"
-FLUX_BACKUP_KEEP="${FLUX_BACKUP_KEEP:-5}"
+FLUX_BACKUP_KEEP="${FLUX_BACKUP_KEEP:-10}"
+export FLUX_BACKUP_KEEP
 FLUX_UPDATE_CHECK_MINUTES="${FLUX_UPDATE_CHECK_MINUTES:-60}"
 FLUX_WARN_MINUTES="${FLUX_WARN_MINUTES:-5}"
 
@@ -35,6 +38,8 @@ tml() { python3 /opt/flux/fluxtml.py "$@"; }
 
 rm -f "${FLUX_RESTART_MARKER}"
 mkdir -p "${FLUX_SERVER_DIR}" "${FLUX_DATA_DIR}" "${FLUX_STATE_DIR}" "${FLUX_GAME_LOG_DIR}"
+# Image 1.0.1 kept the game's logs on the synced data volume: gone, they are on the install now.
+rm -rf "${FLUX_STATE_DIR}/logs" "${FLUX_STATE_DIR}/current.log"
 
 if ! port="$(flux_valid_port "${TML_PORT:-7777}")"; then
   flux_log "ERROR TML_PORT='${TML_PORT:-}' is not a port from 1024 to 65535; refusing to start"
@@ -77,25 +82,13 @@ term_handler() {
 }
 trap term_handler TERM INT
 
-# A .tar.gz of the worlds, the mods' configs, the panel's settings and the ban list (the mods
-# themselves are downloaded again). The last FLUX_BACKUP_KEEP are kept.
+# A .tar.gz of the worlds, the mods' configs, the panel's settings and the ban list
+# (fluxtml.py backup: the rotation that never loses the last day's and the last week's).
 backup_world() {
-  local why="$1" out name items=()
-  [ "${FLUX_BACKUP_KEEP}" -gt 0 ] 2>/dev/null || return 0
-  [ -n "$(find "${FLUX_DATA_DIR}/Worlds" -name '*.wld' -print -quit 2>/dev/null)" ] || return 0
-  for item in Worlds ModConfigs Mods banlist.txt flux/settings.json flux/mods.json; do
-    [ -e "${FLUX_DATA_DIR}/${item}" ] && items+=("${item}")
-  done
-  mkdir -p "${FLUX_BACKUP_DIR}"
-  name="$(date -u +%Y%m%d-%H%M%S)-tmodloader.tar.gz"
-  out="${FLUX_BACKUP_DIR}/${name}"
-  if tar -C "${FLUX_DATA_DIR}" --exclude='Worlds/Backups' -czf "${out}.part" "${items[@]}" 2>/dev/null && mv "${out}.part" "${out}"; then
-    flux_log "backup (${why}): flux/backups/${name}, $(du -h "${out}" | cut -f1)"
-  else
-    rm -f "${out}.part"
-    flux_log "WARN backup (${why}) failed"
-  fi
-  flux_prune "${FLUX_BACKUP_DIR}" "*-tmodloader.tar.gz" "${FLUX_BACKUP_KEEP}"
+  local line
+  while IFS= read -r line; do
+    flux_log "${line#\# }"
+  done < <(tml backup "$1" 2>&1)
 }
 
 # shellcheck disable=SC2329  # run in the background below
@@ -155,6 +148,7 @@ watcher() {
   [ -n "${restart_at}" ] && next_restart="$(flux_next_daily "$(date -u +%s)" "${restart_at}")"
   while true; do
     sleep 60
+    flux_cap_log "$(flux_game_log)"
     now="$(date -u +%s)"
     if [ "${FLUX_UPDATE_CHECK_MINUTES}" -gt 0 ] 2>/dev/null && [ $((now - last_check)) -ge $((FLUX_UPDATE_CHECK_MINUTES * 60)) ]; then
       last_check="${now}"
@@ -177,6 +171,10 @@ start_generation() {
   generation=$((generation + 1))
   rm -f "${FLUX_RESTART_MARKER}"
 
+  export FLUX_GENERATION="${generation}"
+  while IFS= read -r line; do
+    flux_log "${line#\# }"
+  done < <(tml do-restore 2>&1)
   tml state updating "Installing tModLoader and the mods"
   folder=""
   while IFS= read -r line; do

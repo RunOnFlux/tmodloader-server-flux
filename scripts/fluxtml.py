@@ -22,6 +22,12 @@
     flux-tml set-modconfig <file> '<json>'  replace one of them
     flux-tml bans / unban <name|ip>    the ban list
     flux-tml restart                   save, stop and start again (applies the above)
+    flux-tml backups                   the backups in flux/backups: name, size, time, why
+    flux-tml restore <backup>          put a backup back: the server is saved and stopped, what is there
+                                       now is backed up first ("pre-restore"), then it starts again
+    flux-tml mark-pending <what>       the panel changed a file on the volume (an upload): restart applies it
+    fluxtml.py backup <why>            the supervisor's backups (a "start" one only if the newest is old)
+    fluxtml.py do-restore              the supervisor, between two generations: a restore asked for
 
 Settings, mods and configs changed by the panel are applied on the NEXT start. Precedence: an
 environment variable that is SET is applied on every start; one that is not set leaves the panel's
@@ -30,6 +36,7 @@ panel's choice wins (the environment is the default); and an EMPTY MOTD, passwor
 which counts as unset.
 """
 
+import calendar
 import json
 import os
 import re
@@ -52,7 +59,23 @@ MODS_FILE = os.path.join(STATE_DIR, "mods.json")
 MODS_STATE_FILE = os.path.join(STATE_DIR, "mods-state.json")
 DEPS_CACHE = os.path.join(STATE_DIR, "workshop-deps.json")
 CONFIG_FILE = os.path.join(STATE_DIR, "serverconfig.txt")
-GAME_LOG = os.path.join(STATE_DIR, "current.log")
+# The game's log is on the install volume (local), capped by the supervisor: flux-lib.sh.
+GAME_LOG_DIR = os.environ.get("FLUX_GAME_LOG_DIR", os.path.join(SERVER_DIR, "flux-logs"))
+GAME_LOG = os.path.join(GAME_LOG_DIR, "current.log")
+BACKUP_DIR = os.environ.get("FLUX_BACKUP_DIR", os.path.join(STATE_DIR, "backups"))
+BACKUP_INDEX = os.path.join(BACKUP_DIR, "index.json")
+BACKUP_SUFFIX = "-tmodloader.tar.gz"
+# What a backup holds, relative to the data volume (the mods themselves are downloaded again).
+BACKUP_ITEMS = ["Worlds", "ModConfigs", "Mods", "banlist.txt", "flux/settings.json", "flux/mods.json"]
+# A restore asked for by the panel: persistent, so it survives a container restart, and done by the
+# supervisor between two generations (fluxtml.py do-restore), never under a running server.
+RESTORE_REQUEST = os.path.join(STATE_DIR, "restore-request.json")
+RELEASES_CACHE = os.path.join(STATE_DIR, "releases.json")
+UPDATE_WANTED = os.path.join(STATE_DIR, "update-wanted.json")
+UPDATE_FAILED = os.path.join(STATE_DIR, "update-failed.json")
+PENDING_MARK = os.path.join(STATE_DIR, "pending-configs")
+# How long an update that could not be installed is left alone before it is tried again.
+UPDATE_RETRY_SECONDS = int(os.environ.get("FLUX_UPDATE_RETRY_HOURS", "6") or 6) * 3600
 WORLDS_DIR = os.path.join(DATA_DIR, "Worlds")
 MODS_DIR = os.path.join(DATA_DIR, "Mods")
 MODCONFIGS_DIR = os.path.join(DATA_DIR, "ModConfigs")
@@ -61,8 +84,13 @@ INSTALLS = os.path.join(SERVER_DIR, "tml")
 WORKSHOP = os.path.join(SERVER_DIR, "workshop")
 WORKSHOP_CONTENT = os.path.join(WORKSHOP, "steamapps", "workshop", "content", "1281930")
 APP_ID = "1281930"
-RELEASES_API = os.environ.get("FLUX_RELEASES_API", "https://api.github.com/repos/tModLoader/tModLoader/releases?per_page=30")
-RELEASE_ZIP = "https://github.com/tModLoader/tModLoader/releases/download/{tag}/tModLoader.zip"
+RELEASES_API = os.environ.get("FLUX_RELEASES_API", "https://api.github.com/repos/tModLoader/tModLoader/releases?per_page=100")
+# The newest stable release without the API (no rate limit): GitHub redirects it to the tag's page.
+RELEASES_LATEST = os.environ.get("FLUX_RELEASES_LATEST", "https://github.com/tModLoader/tModLoader/releases/latest")
+RELEASE_ZIP = os.environ.get("FLUX_RELEASE_ZIP", "https://github.com/tModLoader/tModLoader/releases/download/{tag}/tModLoader.zip")
+# The release list is read at most this often (each start and each hourly check would otherwise
+# spend the API's 60 unauthenticated requests an hour per address, shared by every server on a node).
+RELEASES_TTL = 3600
 WORKSHOP_PAGE = "https://steamcommunity.com/sharedfiles/filedetails/?id={id}"
 DETAILS_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 
@@ -121,12 +149,30 @@ def clean_text(value, limit):
 
 
 def world_stem(value):
-    """A world's file name without .wld: what Terraria itself makes of a world name (letters,
-    digits, spaces, _ and -), never a path."""
+    """The file name a NEW world gets, without .wld: letters, digits, spaces, _ and -, never a
+    path. Never used to find a world that is there: that is existing_world's (a world copied in by
+    hand, "Bob's World.wld", would be cleaned into another name)."""
     value = os.path.basename(str(value).strip())
     value = re.sub(r"\.t?wld$", "", value, flags=re.I)
     value = re.sub(r"[^\w \-]", "", value).strip()
     return value[:64]
+
+
+def world_files():
+    """The stems of the worlds in Worlds/, exactly as their files are named."""
+    if not os.path.isdir(WORLDS_DIR):
+        return []
+    return sorted((f[:-4] for f in os.listdir(WORLDS_DIR) if f.endswith(".wld") and len(f) > 4), key=str.lower)
+
+
+def existing_world(value):
+    """The stem of a world that IS in Worlds/, matched exactly as `worlds` lists it (a ".wld"
+    ending is allowed); None when there is none. No cleaning: the name is compared, never used to
+    build a path that was not listed."""
+    name = str(value if value is not None else "")
+    if name.lower().endswith(".wld"):
+        name = name[:-4]
+    return name if name and name in world_files() else None
 
 
 def workshop_ids(value):
@@ -150,15 +196,13 @@ def load_settings():
 # world created from the panel with its own choices gets those (the spec always sets the first
 # two, so env-first would make the panel's New World form do nothing).
 NEW_WORLD_KEYS = ("worldSize", "difficulty", "seed")
-# Keys whose empty value means "none": an empty variable (the marketplace writes the declared ones
-# even when left blank) leaves the panel's value instead of erasing it.
-EMPTY_IS_UNSET = ("motd", "password", "seed")
-
-
 def effective(settings, env_name, key, default=None):
+    """(value, source). An EMPTY variable counts as unset, for every setting: the marketplace
+    writes the declared ones even when left blank, and a blank must never erase the panel's value
+    (none of these settings has "empty = off")."""
     if key in NEW_WORLD_KEYS and key in settings:
         return settings[key], "panel"
-    if env_name in os.environ and not (key in EMPTY_IS_UNSET and not str(os.environ[env_name]).strip()):
+    if env_name and str(os.environ.get(env_name, "")).strip():
         return os.environ[env_name], "env"
     if key in settings:
         return settings[key], "panel"
@@ -169,11 +213,11 @@ def effective(settings, env_name, key, default=None):
 # tModLoader builds (GitHub releases)
 # ------------------------------------------------------------------------------------------------
 
-def http_get(url, timeout=30, data=None, tries=3):
+def http_get(url, timeout=30, data=None, tries=3, headers=None):
     """GET (or POST with data). Steam's community pages answer 429 to bursts, for a while: those
     are retried, 5 then 15 seconds later."""
     import urllib.error
-    req = urllib.request.Request(url, data=data, headers={"User-Agent": "runonflux/tmodloader-server-flux", "Accept": "*/*"})
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": "runonflux/tmodloader-server-flux", "Accept": "*/*", **(headers or {})})
     for attempt in range(tries):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -212,11 +256,77 @@ def installed_versions():
     return sorted(found, key=parse_version, reverse=True)
 
 
-def latest_release_tag(wanted):
+def github_headers():
+    """GITHUB_TOKEN, when the deploy sets one: 5000 requests an hour instead of 60 per address."""
+    token = str(os.environ.get("GITHUB_TOKEN", "")).strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def release_list(now=None):
+    """The release list, from the cache on the data volume when it is younger than RELEASES_TTL or
+    when GitHub said to wait (403/429, until its reset time). None when there is neither."""
+    import urllib.error
+    now = time.time() if now is None else now
+    cache = read_json(RELEASES_CACHE, {}) or {}
+    fresh = isinstance(cache.get("releases"), list) and now - cache.get("at", 0) < RELEASES_TTL
+    if fresh or now < cache.get("backoffUntil", 0):
+        return cache.get("releases")
     try:
-        return pick_release(json.loads(http_get(RELEASES_API)), wanted)
+        releases = json.loads(http_get(RELEASES_API, tries=1, headers=github_headers()))
+        if not isinstance(releases, list):
+            raise ValueError("not a release list")
+        write_json(RELEASES_CACHE, {"at": int(now), "releases": [
+            {"tag_name": r.get("tag_name"), "prerelease": bool(r.get("prerelease"))} for r in releases if isinstance(r, dict)]}, indent=None)
+        return read_json(RELEASES_CACHE, {}).get("releases")
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            reset = e.headers.get("X-RateLimit-Reset") or ""
+            retry = e.headers.get("Retry-After") or ""
+            until = int(reset) if reset.isdigit() else now + (int(retry) if retry.isdigit() else 3600)
+            cache["backoffUntil"] = int(min(until, now + 6 * 3600))
+            try:
+                write_json(RELEASES_CACHE, cache, indent=None)
+            except OSError:
+                pass
+            log(f"WARN GitHub's API asked to wait (HTTP {e.code}) until {time.strftime('%H:%M UTC', time.gmtime(cache['backoffUntil']))}: using what is known")
+    except Exception:
+        pass
+    return cache.get("releases")
+
+
+def latest_stable_from_redirect():
+    """The newest stable tag from github.com/<repo>/releases/latest, which redirects to the tag's
+    page: no API, no rate limit."""
+    try:
+        req = urllib.request.Request(RELEASES_LATEST, headers={"User-Agent": "runonflux/tmodloader-server-flux"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            tag = r.geturl().rstrip("/").rsplit("/", 1)[-1]
+        return tag if parse_version(tag) else None
     except Exception:
         return None
+
+
+def normalize_tag(wanted):
+    """An exact version as GitHub names the tag: "2026.8.3.0" -> "v2026.08.3.0"."""
+    v = parse_version(wanted)
+    return f"v{v[0]}.{v[1]:02d}.{v[2]}.{v[3]}" if v else None
+
+
+def latest_release_tag(wanted, now=None):
+    """The tag TML_VERSION names. An exact version needs no lookup at all; stable falls back on the
+    /releases/latest redirect when the API cannot answer; preview needs the list."""
+    wanted = (wanted or "stable").strip()
+    exact = wanted.lower() not in ("stable", "preview")
+    releases = release_list(now)
+    if releases:
+        tag = pick_release(releases, wanted)
+        if tag:
+            return tag
+    if exact:
+        return normalize_tag(wanted)
+    if wanted.lower() == "stable":
+        return latest_stable_from_redirect()
+    return None
 
 
 def cmd_install():
@@ -256,8 +366,9 @@ def cmd_install():
             os.replace(os.path.join(staging, "tml"), folder)
         except Exception as e:
             shutil.rmtree(staging, ignore_errors=True)
+            mark_update_failed(f"tml:{tag}")
             if have:
-                log(f"WARN could not install {tag} ({e}): starting the installed {have[0]}")
+                log(f"WARN could not install {tag} ({e}): starting the installed {have[0]}; not tried again for {UPDATE_RETRY_SECONDS // 3600} h")
                 print(os.path.join(INSTALLS, have[0]))
                 return
             fail(f"could not install tModLoader {tag}: {e}", 3)
@@ -429,9 +540,59 @@ def download(ids):
         missing = [i for i in ids if not os.path.isdir(os.path.join(WORKSHOP_CONTENT, i))]
         if r.returncode == 0 and not missing:
             return True
-        log(f"WARN steamcmd attempt {attempt + 1}/3: {len(missing)} item(s) missing")
+        tail = " | ".join(line.strip() for line in (r.stdout + r.stderr).splitlines() if re.search(r"ERROR|Error|fail|Timed out", line))[-400:]
+        log(f"WARN steamcmd attempt {attempt + 1}/3 (exit {r.returncode}): {len(missing)} item(s) missing{': ' + tail if tail else ''}")
         time.sleep(5)
     return False
+
+
+def workshop_times():
+    """{item id: the time_updated of the files SteamCMD has}, from its appworkshop manifest."""
+    acf = os.path.join(WORKSHOP, "steamapps", "workshop", f"appworkshop_{APP_ID}.acf")
+    try:
+        text = open(acf, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return {}
+    times = {}
+    for m in re.finditer(r'"(\d+)"\s*\{[^{}]*?"timeupdated"\s+"(\d+)"', text):
+        times.setdefault(m.group(1), int(m.group(2)))
+    return times
+
+
+# ------------------------------------------------------------------------------------------------
+# Updates that could not be installed: remembered, so a failing download is not retried (with a
+# restart and five minutes of warnings in chat each time) every hour
+# ------------------------------------------------------------------------------------------------
+
+def failed_updates(now=None):
+    now = time.time() if now is None else now
+    data = read_json(UPDATE_FAILED, {}) or {}
+    return {k: v for k, v in data.items() if isinstance(v, (int, float)) and now - v < UPDATE_RETRY_SECONDS}
+
+
+def mark_update_failed(target, now=None):
+    data = failed_updates(now)
+    data[target] = int(time.time() if now is None else now)
+    try:
+        write_json(UPDATE_FAILED, data, indent=None)
+    except OSError:
+        pass
+
+
+def settle_wanted_updates():
+    """After a start: every Workshop update the watcher restarted for that is still not on disk is
+    remembered as failed (its tModLoader half is cmd_install's)."""
+    wanted = read_json(UPDATE_WANTED, {}) or {}
+    times = workshop_times()
+    for target in wanted.get("targets", []):
+        parts = str(target).split(":")
+        if parts[0] == "mod" and len(parts) == 3 and times.get(parts[1], 0) < int(parts[2] or 0):
+            mark_update_failed(target)
+            log(f"WARN the update of Workshop item {parts[1]} did not download: not tried again for {UPDATE_RETRY_SECONDS // 3600} h")
+    try:
+        os.remove(UPDATE_WANTED)
+    except OSError:
+        pass
 
 
 def load_mods_file():
@@ -495,6 +656,17 @@ def _sync_mods():
                 entry.update({"name": fname[:-5], "error": f"unreadable .tmod ({e})"})
             mods.append(entry)
     disabled = set(panel["disabled"])
+    # The same mod twice (a Workshop item and an uploaded .tmod of the same internal name):
+    # tModLoader loads one of them, and which one is not documented. Both are flagged.
+    by_name = {}
+    for m in mods:
+        if m.get("name"):
+            by_name.setdefault(m["name"], []).append(m)
+    for name, copies in by_name.items():
+        if len(copies) > 1:
+            for m in copies:
+                m["duplicate"] = True
+            log(f"WARN two copies of {name} ({', '.join(c['source'] for c in copies)}): tModLoader loads only one; remove the one you do not want")
     enabled = []
     for m in mods:
         m["enabled"] = bool(m.get("name")) and m["name"] not in disabled and not m.get("error")
@@ -509,6 +681,7 @@ def _sync_mods():
     write_json(os.path.join(MODS_DIR, "enabled.json"), enabled)
     write_json(MODS_STATE_FILE, {"mods": mods, "enabled": enabled, "at": int(time.time()), "tml": current_tml_version()})
     log(f"enabled.json: {', '.join(enabled) if enabled else '(no mods)'}")
+    settle_wanted_updates()
 
 
 # ------------------------------------------------------------------------------------------------
@@ -523,7 +696,9 @@ def cmd_apply():
     name, src = effective(settings, "TML_WORLD_NAME", "worldName", "Terraria on Flux")
     name = clean_text(name, 64) or "Terraria on Flux"
     world, wsrc = effective(settings, "TML_WORLD", "world", None)
-    stem = world_stem(world) if world else world_stem(name)
+    # A world that is there is loaded by its EXACT file name ("Bob's World.wld" too); only a world
+    # that does not exist yet gets a cleaned name, which is the file the server then creates.
+    stem = (existing_world(world) or world_stem(world)) if world else (existing_world(name) or world_stem(name))
     stem = stem or "World"
     world_file = os.path.join(WORLDS_DIR, stem + ".wld")
     new_world = not os.path.exists(world_file)
@@ -580,7 +755,13 @@ def cmd_apply():
     state = read_json(STATE_FILE, {}) or {}
     state["applied"] = int(time.time()) + 1
     state["world"] = stem
+    # What the server starts with, for changes_pending: the uploaded .tmod files.
+    state["tmods"] = tmod_snapshot()
     write_json(STATE_FILE, state, indent=None)
+    try:
+        os.remove(PENDING_MARK)
+    except OSError:
+        pass
 
 
 # ------------------------------------------------------------------------------------------------
@@ -588,30 +769,40 @@ def cmd_apply():
 # ------------------------------------------------------------------------------------------------
 
 def cmd_updates():
+    """What is out of date, as lines for the watcher, leaving out what failed to install less than
+    FLUX_UPDATE_RETRY_HOURS ago; and the targets, for settle_wanted_updates after the restart."""
     wanted = os.environ.get("TML_VERSION", "stable") or "stable"
     have = installed_versions()
+    failed = failed_updates()
+    lines, targets = [], []
     if wanted.lower() in ("stable", "preview") and have:
         tag = latest_release_tag(wanted)
-        if tag and parse_version(tag) > parse_version(have[0]):
-            print(f"tml {have[0]} {tag}")
+        if tag and parse_version(tag) > parse_version(have[0]) and f"tml:{tag}" not in failed:
+            lines.append(f"tml {have[0]} {tag}")
+            targets.append(f"tml:{tag}")
     state = read_json(MODS_STATE_FILE, {}) or {}
     ids = [m["id"] for m in state.get("mods", []) if m.get("id")]
-    if not ids:
-        return
-    form = "&".join([f"itemcount={len(ids)}"] + [f"publishedfileids%5B{i}%5D={x}" for i, x in enumerate(ids)])
-    try:
-        details = json.loads(http_get(DETAILS_API, data=form.encode()))["response"]["publishedfiledetails"]
-    except Exception:
-        return
-    acf = os.path.join(WORKSHOP, "steamapps", "workshop", f"appworkshop_{APP_ID}.acf")
-    try:
-        text = open(acf, encoding="utf-8", errors="replace").read()
-    except OSError:
-        return
-    for d in details:
-        m = re.search(r'"%s"\s*\{[^}]*?"timeupdated"\s+"(\d+)"' % re.escape(str(d.get("publishedfileid"))), text)
-        if m and int(d.get("time_updated") or 0) > int(m.group(1)):
-            print(f"mod {d['publishedfileid']} {d.get('title', '')}")
+    if ids:
+        form = "&".join([f"itemcount={len(ids)}"] + [f"publishedfileids%5B{i}%5D={x}" for i, x in enumerate(ids)])
+        try:
+            details = json.loads(http_get(DETAILS_API, data=form.encode()))["response"]["publishedfiledetails"]
+        except Exception:
+            details = []
+        times = workshop_times()
+        for d in details:
+            item = str(d.get("publishedfileid"))
+            remote = int(d.get("time_updated") or 0)
+            target = f"mod:{item}:{remote}"
+            if item in times and remote > times[item] and target not in failed:
+                lines.append(f"mod {item} {d.get('title', '')}")
+                targets.append(target)
+    if targets:
+        try:
+            write_json(UPDATE_WANTED, {"targets": targets, "at": int(time.time())}, indent=None)
+        except OSError:
+            pass
+    for line in lines:
+        print(line)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -623,6 +814,14 @@ def cmd_state(state, message=None):
     if data.get("state") != state:
         data["since"] = int(time.time())
     data.update({"state": state, "message": message or None, "image": os.environ.get("FLUX_IMAGE_VERSION", "dev")})
+    # The supervisor's generation: the panel waits for a NEW one after a restart, never comparing
+    # its own clock with the node's.
+    if str(os.environ.get("FLUX_GENERATION", "")).isdigit():
+        data["generation"] = int(os.environ["FLUX_GENERATION"])
+    if state == "running":
+        tml, terraria = game_versions(read_head(GAME_LOG, 200))
+        if tml or terraria:
+            data["versions"] = {"tml": tml, "terraria": terraria}
     write_json(STATE_FILE, data, indent=None)
 
 
@@ -634,42 +833,81 @@ def console(command, timeout=8):
         return None
 
 
-PLAYER_LINE = re.compile(r"^:?\s*(.+?) \((\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]+)(?::\d+)?\)\s*$")
+PLAYER_LINE = re.compile(r"^(.+?) \((\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]+)(?::\d+)?\)\s*$")
+SUMMARY_LINE = re.compile(r"^(?:No players connected\.|\d+ players? connected\.)$")
 
 
 def parse_playing(text):
-    """`playing`: ": No players connected." or one line per player, "Name (IP:port)", then
-    ": N player(s) connected." (Terraria's server)."""
+    """`playing` as flux-console prints it (the console's ": " taken off): one line per player,
+    "Name (IP:port)", then the summary ("No players connected." / "N player(s) connected.").
+
+    Only the lines BEFORE the summary are players, and only when there is a summary: anything else
+    the server printed in that second (chat "<Bob> brb (10.0.0.1)", a join) is not the answer. A
+    name may hold anything, "Disconnected Dan" included."""
+    lines = [re.sub(r"^:\s?", "", line.strip()).strip() for line in (text or "").splitlines()]
+    end = next((i for i, line in enumerate(lines) if SUMMARY_LINE.match(line)), None)
+    if end is None:
+        return []
     players = []
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line or "connected" in line.lower():
+    for line in lines[:end]:
+        if not line or line.startswith("<") or line.lower() == "playing":
             continue
         m = PLAYER_LINE.match(line)
         if m:
-            players.append({"name": m.group(1).lstrip(": ").strip(), "ip": m.group(2)})
+            players.append({"name": m.group(1).strip(), "ip": m.group(2)})
     return players
 
 
+def tmod_snapshot():
+    """The uploaded .tmod files as "name:mtime": a file added, removed or replaced changes it."""
+    if not os.path.isdir(MODS_DIR):
+        return []
+    out_ = []
+    for fname in sorted(os.listdir(MODS_DIR)):
+        if fname.endswith(".tmod"):
+            try:
+                out_.append(f"{fname}:{int(os.path.getmtime(os.path.join(MODS_DIR, fname)))}")
+            except OSError:
+                pass
+    return out_
+
+
 def changes_pending(state):
+    """The panel saved something the running server has not loaded: settings, the mod list, an
+    uploaded or removed .tmod, a mod config (set-modconfig marks it; tModLoader writes its own
+    configs while it runs, so the folder's times cannot tell)."""
+    applied = state.get("applied") or 0
     for path in (SETTINGS_FILE, MODS_FILE):
         try:
-            if os.path.getmtime(path) > (state.get("applied") or 0):
+            if os.path.getmtime(path) > applied:
                 return True
         except OSError:
             pass
-    return False
+    if os.path.exists(PENDING_MARK) or os.path.exists(RESTORE_REQUEST):
+        return True
+    return "tmods" in state and tmod_snapshot() != state.get("tmods")
+
+
+def game_versions(lines):
+    """(tModLoader, Terraria) from the start banner: "Terraria Server v1.4.4.9 - tModLoader v2026.8.3.0"."""
+    tml = terraria = None
+    for line in lines:
+        m = re.search(r"tModLoader v(\d{4}\.\d+\.\d+\.\d+)", line)
+        if m:
+            tml = m.group(1)
+        m = re.search(r"Terraria Server v(\d+\.\d+\.\d+(?:\.\d+)?)", line)
+        if m:
+            terraria = m.group(1)
+    return tml, terraria
 
 
 def cmd_status():
     state = read_json(STATE_FILE, {}) or {}
     running = state.get("state") == "running"
     players = parse_playing(console("playing")) if running else []
-    version = None
-    for line in read_tail(GAME_LOG, 400):
-        m = re.search(r"tModLoader v(\d{4}\.\d+\.\d+\.\d+)", line)
-        if m:
-            version = m.group(1)
+    version, terraria = game_versions(read_head(GAME_LOG, 200))
+    known = state.get("versions") or {}
+    version, terraria = version or known.get("tml"), terraria or known.get("terraria")
     mods = read_json(MODS_STATE_FILE, {}) or {}
     settings = load_settings()
     players_max, _ = effective(settings, "TML_MAX_PLAYERS", "maxPlayers", 8)
@@ -677,9 +915,10 @@ def cmd_status():
         "state": state.get("state", "stopped"),
         "message": state.get("message"),
         "since": state.get("since"),
+        "generation": state.get("generation"),
         "image": state.get("image"),
         "version": version or current_tml_version(),
-        "terraria": "1.4.4.9",
+        "terraria": terraria,
         "world": state.get("world"),
         "players": players,
         "max_players": int(players_max) if str(players_max).isdigit() else None,
@@ -688,10 +927,23 @@ def cmd_status():
     })
 
 
-def read_tail(path, n):
+def read_head(path, n, limit=256 * 1024):
+    """The first n lines, reading at most `limit` bytes: the start banner, whatever the log grew to."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return f.readlines()[-n:]
+        with open(path, "rb") as f:
+            return f.read(limit).decode("utf-8", "replace").splitlines()[:n]
+    except OSError:
+        return []
+
+
+def read_tail(path, n, limit=512 * 1024):
+    """The last n lines, reading at most the last `limit` bytes (never a whole log)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            return f.read().decode("utf-8", "replace").splitlines()[-n:]
     except OSError:
         return []
 
@@ -737,9 +989,15 @@ def cmd_set_settings(raw):
             settings.pop(key, None)
             continue
         if key == "world":
-            value = world_stem(value)
-            if not value:
-                errors.append("world must be a world's name")
+            # A world that is there, by its exact name; or a NEW one, whose name must already be
+            # the file name the server creates (letters, digits, spaces, _ and -).
+            exact = existing_world(value)
+            if exact:
+                value = exact
+            elif str(value).strip() and world_stem(value) == str(value).strip():
+                value = str(value).strip()
+            else:
+                errors.append("world must be the exact name of a world in Worlds/, or a new name of letters, digits, spaces, - and _")
                 continue
         elif key == "worldSize" and str(value).lower() not in SIZES:
             errors.append("worldSize must be small, medium or large")
@@ -792,18 +1050,22 @@ def cmd_worlds():
 
 
 def cmd_delete_world(name):
-    stem = world_stem(name)
+    """Deletes ONE world, matched exactly as `worlds` lists it: its .wld and .twld and the game's
+    own copies of exactly those files (".wld.bak", ".twld.bak", ".wld.bak2"...). Never the active
+    world, and never by a cleaned-up name (which could be another world's)."""
+    stem = existing_world(name)
     state = read_json(STATE_FILE, {}) or {}
-    if not stem or stem == state.get("world"):
+    if not stem:
+        fail("no such world", 2)
+    if stem == state.get("world"):
         fail("that is the active world: switch to another one first", 2)
     removed = []
-    for fname in os.listdir(WORLDS_DIR) if os.path.isdir(WORLDS_DIR) else []:
-        if fname == stem + ".wld" or fname == stem + ".twld" or fname.startswith(stem + ".wld.") or fname.startswith(stem + ".twld."):
-            os.remove(os.path.join(WORLDS_DIR, fname))
-            removed.append(fname)
-    if not removed:
-        fail("no such world", 2)
-    out({"ok": True, "removed": removed})
+    for fname in os.listdir(WORLDS_DIR):
+        for ext in (".wld", ".twld"):
+            if fname == stem + ext or (fname.startswith(stem + ext + ".") and re.fullmatch(r"bak\d*", fname[len(stem + ext) + 1:])):
+                os.remove(os.path.join(WORLDS_DIR, fname))
+                removed.append(fname)
+    out({"ok": True, "removed": sorted(removed)})
 
 
 # ------------------------------------------------------------------------------------------------
@@ -863,7 +1125,15 @@ def cmd_set_modconfig(fname, raw):
     except ValueError:
         fail("not JSON", 2)
     write_json(os.path.join(MODCONFIGS_DIR, fname), data)
+    write_text(PENDING_MARK, f"{fname}\n")
     out({"ok": True, "file": fname, "appliesOn": "restart"})
+
+
+def cmd_mark_pending(what):
+    """The panel changed something on the volume itself (an uploaded or removed file): the next
+    status says a restart applies it."""
+    write_text(PENDING_MARK, f"{clean_text(what, 120)}\n")
+    out({"ok": True})
 
 
 # ------------------------------------------------------------------------------------------------
@@ -896,13 +1166,181 @@ def cmd_unban(who):
     out({"ok": True, "lifted": len(bans) - len(keep), "appliesOn": "restart"})
 
 
-def cmd_restart():
-    pids = subprocess.run(["pgrep", "-f", r"^dotnet tModLoader\.dll "], capture_output=True, text=True).stdout.split()
-    if not pids:
-        fail("the server is not running", 3)
+# ------------------------------------------------------------------------------------------------
+# Backups and restore
+# ------------------------------------------------------------------------------------------------
+
+BACKUP_NAME = re.compile(r"^\d{8}-\d{6}" + re.escape(BACKUP_SUFFIX) + r"$")
+
+
+def backup_list():
+    """[(name, epoch)] newest first. The epoch is the name's UTC time (the file's own time can be
+    changed by a copy)."""
+    if not os.path.isdir(BACKUP_DIR):
+        return []
+    found = []
+    for n in os.listdir(BACKUP_DIR):
+        if BACKUP_NAME.match(n):
+            try:
+                found.append((n, calendar.timegm(time.strptime(n[:15], "%Y%m%d-%H%M%S"))))
+            except ValueError:
+                pass
+    return sorted(found, key=lambda x: x[0], reverse=True)
+
+
+def backups_to_keep(names_times, keep, now):
+    """The newest `keep`, AND the newest one older than a day and the newest one older than a
+    week: a server that crash-loops (one backup per start) can never rotate every good backup
+    away. names_times newest first."""
+    kept = {n for n, _ in names_times[:max(keep, 1)]}
+    for age in (86400, 7 * 86400):
+        older = [n for n, t in names_times if now - t >= age]
+        if older:
+            kept.add(older[0])
+    return kept
+
+
+def cmd_backup(why, now=None):
+    """A .tar.gz of BACKUP_ITEMS. A "start" backup is skipped when the newest one is younger than
+    FLUX_BACKUP_MIN_AGE_MINUTES (every restart, crash restart and update would otherwise rotate the
+    history away within the hour). Written beside, then renamed."""
+    import tarfile
+    now = time.time() if now is None else now
+    keep = int(os.environ.get("FLUX_BACKUP_KEEP", "10") or 10)
+    if keep <= 0:
+        return
+    if not any(f.endswith(".wld") for f in (os.listdir(WORLDS_DIR) if os.path.isdir(WORLDS_DIR) else [])):
+        return
+    existing = backup_list()
+    min_age = int(os.environ.get("FLUX_BACKUP_MIN_AGE_MINUTES", "60") or 60) * 60
+    if why == "start" and existing and now - existing[0][1] < min_age:
+        log(f"backup (start): skipped, the newest is {int((now - existing[0][1]) // 60)} min old")
+        return
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    name = time.strftime("%Y%m%d-%H%M%S", time.gmtime(now)) + BACKUP_SUFFIX
+    path = os.path.join(BACKUP_DIR, name)
+    part = path + ".part"
+    try:
+        with tarfile.open(part, "w:gz") as tar:
+            for item in BACKUP_ITEMS:
+                src = os.path.join(DATA_DIR, item)
+                if os.path.exists(src):
+                    # A file the server rewrites while it is read is archived as it was read: the
+                    # world itself was saved just before (`save` / `exit`).
+                    # tModLoader's own dated zips (Worlds/Backups) are left out: they only grow.
+                    tar.add(src, arcname=item, filter=lambda ti: None if ti.name == "Worlds/Backups" or ti.name.startswith("Worlds/Backups/") else ti)
+        os.replace(part, path)
+    except (OSError, tarfile.TarError) as e:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        log(f"WARN backup ({why}) failed: {e}")
+        return
+    index = read_json(BACKUP_INDEX, {}) or {}
+    index[name] = {"why": why, "at": int(now)}
+    names_times = backup_list()
+    kept = backups_to_keep(names_times, keep, now)
+    for n, _ in names_times:
+        if n not in kept:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, n))
+            except OSError:
+                pass
+            index.pop(n, None)
+    write_json(BACKUP_INDEX, {k: v for k, v in index.items() if os.path.exists(os.path.join(BACKUP_DIR, k))}, indent=None)
+    log(f"backup ({why}): flux/backups/{name}, {os.path.getsize(path) // 1024} KB")
+
+
+def cmd_backups():
+    index = read_json(BACKUP_INDEX, {}) or {}
+    rows = []
+    for n, t in backup_list():
+        try:
+            size = os.path.getsize(os.path.join(BACKUP_DIR, n))
+        except OSError:
+            continue
+        rows.append({"name": n, "size": size, "at": t, "why": (index.get(n) or {}).get("why")})
+    out({"backups": rows, "path": "flux/backups", "restore": read_json(RESTORE_REQUEST)})
+
+
+def cmd_restore(name):
+    """Asks for a restore: the supervisor stops the server (saving it), takes a "pre-restore"
+    backup of what is there now, puts the backup's files in place and starts again. Persistent, so a
+    server that is not running gets it on its next start."""
+    if not BACKUP_NAME.match(str(name)) or not os.path.isfile(os.path.join(BACKUP_DIR, name)):
+        fail("no such backup", 2)
+    write_json(RESTORE_REQUEST, {"name": name, "at": int(time.time())}, indent=None)
+    if not server_pids():
+        out({"ok": True, "appliesOn": "start"})
+        return
+    request_restart(f"requested: restore {name}")
+    out({"ok": True, "appliesOn": "now"})
+
+
+def cmd_do_restore():
+    """The supervisor, between two generations: the restore the panel asked for, if any."""
+    import tarfile
+    req = read_json(RESTORE_REQUEST)
+    if not isinstance(req, dict):
+        return
+    name = str(req.get("name", ""))
+    archive = os.path.join(BACKUP_DIR, name)
+    try:
+        os.remove(RESTORE_REQUEST)
+    except OSError:
+        pass
+    if not BACKUP_NAME.match(name) or not os.path.isfile(archive):
+        log(f"WARN restore: no backup named {name!r}")
+        return
+    cmd_backup("pre-restore")
+    staging = os.path.join(DATA_DIR, ".flux-restore")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging)
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            members = []
+            for m in tar.getmembers():
+                top = m.name.split("/")[0]
+                if m.name.startswith("/") or ".." in m.name.split("/") or not (m.isfile() or m.isdir()):
+                    continue
+                if top in ("Worlds", "ModConfigs", "Mods", "banlist.txt") or m.name in ("flux", "flux/settings.json", "flux/mods.json"):
+                    members.append(m)
+            tar.extractall(staging, members=members)
+        restored = []
+        for item in BACKUP_ITEMS:
+            src = os.path.join(staging, item)
+            if not os.path.exists(src):
+                continue
+            dst = os.path.join(DATA_DIR, item)
+            if os.path.isdir(dst) and not os.path.islink(dst):
+                shutil.rmtree(dst)
+            elif os.path.exists(dst):
+                os.remove(dst)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.replace(src, dst)
+            restored.append(item)
+        log(f"restore: {name} put back ({', '.join(restored)}); what was there is in a pre-restore backup")
+    except (OSError, tarfile.TarError) as e:
+        log(f"WARN restore of {name} failed: {e}; nothing was replaced past that point")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def server_pids():
+    return subprocess.run(["pgrep", "-f", r"^dotnet tModLoader\.dll "], capture_output=True, text=True).stdout.split()
+
+
+def request_restart(why):
     with open(os.environ.get("FLUX_RESTART_MARKER", "/tmp/flux-restart-requested"), "w") as f:
-        f.write("requested: from the panel\n")
+        f.write(why + "\n")
     console("exit", timeout=2)
+
+
+def cmd_restart():
+    if not server_pids():
+        fail("the server is not running", 3)
+    request_restart("requested: from the panel")
     out({"ok": True})
 
 
@@ -913,8 +1351,10 @@ def main(argv):
         "settings": (cmd_settings, 0), "set-settings": (cmd_set_settings, 1), "worlds": (cmd_worlds, 0),
         "delete-world": (cmd_delete_world, 1), "mods": (cmd_mods, 0), "set-mods": (cmd_set_mods, 1),
         "mod-search-deps": (cmd_mod_search_deps, 1), "modconfigs": (cmd_modconfigs, 0),
-        "set-modconfig": (cmd_set_modconfig, 2), "bans": (cmd_bans, 0), "unban": (cmd_unban, 1),
-        "restart": (cmd_restart, 0),
+        "set-modconfig": (cmd_set_modconfig, 2), "mark-pending": (cmd_mark_pending, 1),
+        "bans": (cmd_bans, 0), "unban": (cmd_unban, 1), "restart": (cmd_restart, 0),
+        "backup": (cmd_backup, 1), "backups": (cmd_backups, 0), "restore": (cmd_restore, 1),
+        "do-restore": (cmd_do_restore, 0),
     }
     if not argv or argv[0] not in commands:
         print(__doc__, file=sys.stderr)

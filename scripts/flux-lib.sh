@@ -14,8 +14,12 @@ FLUX_DATA_DIR="${FLUX_DATA_DIR:-/mnt/tml/data}"
 FLUX_STATE_DIR="${FLUX_STATE_DIR:-${FLUX_DATA_DIR}/flux}"
 FLUX_LOG="${FLUX_LOG:-${FLUX_STATE_DIR}/flux.log}"
 FLUX_LOG_MAX_LINES="${FLUX_LOG_MAX_LINES:-2000}"
-FLUX_GAME_LOG_DIR="${FLUX_GAME_LOG_DIR:-${FLUX_STATE_DIR}/logs}"
+# The game's console logs: on the INSTALL volume (local to the node), not the synced data volume,
+# where a log that grows all day kept Syncthing busy. Each one is capped at
+# FLUX_GAME_LOG_MAX_BYTES (copied aside and truncated) and the newest FLUX_GAME_LOG_KEEP kept.
+FLUX_GAME_LOG_DIR="${FLUX_GAME_LOG_DIR:-${FLUX_SERVER_DIR}/flux-logs}"
 FLUX_GAME_LOG_KEEP="${FLUX_GAME_LOG_KEEP:-10}"
+FLUX_GAME_LOG_MAX_BYTES="${FLUX_GAME_LOG_MAX_BYTES:-20000000}"
 FLUX_BACKUP_DIR="${FLUX_BACKUP_DIR:-${FLUX_STATE_DIR}/backups}"
 FLUX_RESTART_MARKER="${FLUX_RESTART_MARKER:-/tmp/flux-restart-requested}"
 # The server's console is its stdin: a FIFO the supervisor holds open; flux-console writes one
@@ -140,7 +144,18 @@ flux_prune() {
 # ---------------------------------------------------------------------------------------------
 
 flux_game_log() {
-  printf '%s' "${FLUX_STATE_DIR}/current.log"
+  printf '%s' "${FLUX_GAME_LOG_DIR}/current.log"
+}
+
+# $1 = the current game log. Past FLUX_GAME_LOG_MAX_BYTES it is copied aside and truncated in
+# place: the server writes it with O_APPEND (>>), so it goes on at the start of the emptied file.
+flux_cap_log() {
+  local log="$1" size
+  size="$(stat -c %s "${log}" 2>/dev/null || echo 0)"
+  [ "${size}" -gt "${FLUX_GAME_LOG_MAX_BYTES}" ] || return 0
+  cp "${log}" "${FLUX_GAME_LOG_DIR}/$(date -u +%Y%m%d-%H%M%S)-server.log" 2>/dev/null
+  : >"${log}"
+  flux_prune "${FLUX_GAME_LOG_DIR}" '*-server.log' "${FLUX_GAME_LOG_KEEP}"
 }
 
 flux_game_pid() {

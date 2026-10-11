@@ -71,7 +71,7 @@ exec -a dotnet bash "$@"
 STUB
 chmod +x /usr/bin/dotnet
 
-export FLUX_RELEASES_API="http://127.0.0.1:9/" TML_VERSION=stable FLUX_RESTART_BACKOFF=1 FLUX_UPDATE_CHECK_MINUTES=0 TML_WORLD_NAME="Image Test"
+export FLUX_RELEASES_API="http://127.0.0.1:9/" FLUX_RELEASES_LATEST="http://127.0.0.1:9/latest" TML_VERSION=stable FLUX_RESTART_BACKOFF=1 FLUX_UPDATE_CHECK_MINUTES=0 TML_WORLD_NAME="Image Test"
 /opt/flux/flux-entrypoint.sh >/tmp/entry.log 2>&1 &
 entry=$!
 check "the server comes up" "0" "$(status wait_for 'grep -q "\"running\"" ${data}/flux/state.json 2>/dev/null' 30)"
@@ -80,6 +80,9 @@ check "the world was created" "0" "$(status test -f "${data}/Worlds/Image Test.w
 check "enabled.json is written" "[]" "$(tr -d ' \n' <"${data}/Mods/enabled.json")"
 check "the console answers" "No players connected." "$(flux-console playing)"
 check "status reads the console" "[]" "$(flux-tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["players"])')"
+check "the game's log is on the install volume, not the synced data" "0" "$(status test -s /mnt/tml/server/flux-logs/current.log)"
+check "and none on the data volume" "1" "$(status test -e "${data}/flux/current.log")"
+check "the status has the generation" "1" "$(flux-tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
 
 flux-tml set-settings '{"world": "Second"}' >/dev/null
 flux-tml restart >/dev/null
@@ -87,10 +90,20 @@ check "a panel restart saves through exit" "0" "$(status wait_for 'grep -q saved
 check "and starts the panel's world" "0" "$(status wait_for 'test -f ${data}/Worlds/Second.wld && grep -q "\"running\"" ${data}/flux/state.json' 30)"
 check "the restart was not counted as a crash" "0" "$(grep -c 'restarts within' /tmp/entry.log)"
 check "a backup on the second start" "0" "$(status wait_for 'ls ${data}/flux/backups/*-tmodloader.tar.gz' 5)"
+check "a new generation" "2" "$(flux-tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
+
+# Restore, through the supervisor: the server is stopped, the backup put back, started again.
+backup="$(flux-tml backups | python3 -c 'import json,sys;print(json.load(sys.stdin)["backups"][0]["name"])')"
+printf x >"${data}/Worlds/Made Later.wld"
+check "a restore is applied now" "now" "$(flux-tml restore "${backup}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["appliesOn"])')"
+check "the server comes back after the restore" "0" "$(status wait_for 'grep -q "\"generation\": 3" ${data}/flux/state.json && grep -q "\"running\"" ${data}/flux/state.json' 40)"
+check "the backup's worlds are back (a world made later is gone)" "1" "$(status test -f "${data}/Worlds/Made Later.wld")"
+check "with a pre-restore backup of what was there" "1" "$(flux-tml backups | python3 -c 'import json,sys;print(sum(1 for b in json.load(sys.stdin)["backups"] if b["why"]=="pre-restore"))')"
+check "the restore is not counted as a crash" "0" "$(grep -c 'restarts within' /tmp/entry.log)"
 
 kill -TERM "${entry}"
 check "a stop ends the supervisor" "0" "$(status wait_for '! kill -0 ${entry} 2>/dev/null' 20)"
-check "and saves the world" "1" "$(grep -c saved-on-exit "${data}/Worlds/Second.wld")"
+check "and saves the world" "0" "$(status grep -q saved-on-exit "${data}/Worlds/Second.wld")"
 check "and says stopped" "stopped" "$(python3 -c 'import json;print(json.load(open("'"${data}"'/flux/state.json"))["state"])')"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"

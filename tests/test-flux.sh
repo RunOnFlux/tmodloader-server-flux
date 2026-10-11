@@ -66,9 +66,10 @@ check "players capped at 255" "255" "$(cfgval maxplayers)"
 tml TML_MAX_PLAYERS=lots apply >/dev/null
 check "a bad player count is 8" "8" "$(cfgval maxplayers)"
 
-check "the panel takes a world" "0" "$(status tml set-settings '{"world": "../Other World.wld", "password": "pw", "motd": "hi"}')"
+check "a world name with a path is refused" "2" "$(status tml set-settings '{"world": "../Other World.wld"}')"
+check "the panel takes a new world" "0" "$(status tml set-settings '{"world": "Other World", "password": "pw", "motd": "hi"}')"
 tml apply >/dev/null
-check "the panel's world, as a plain name" "${data}/Worlds/Other World.wld" "$(cfgval world)"
+check "the panel's new world" "${data}/Worlds/Other World.wld" "$(cfgval world)"
 check "the panel's password" "pw" "$(cfgval password)"
 check "the motd" "hi" "$(cfgval motd)"
 tml TML_PASSWORD="" apply >/dev/null
@@ -150,6 +151,92 @@ check "a missing world" "2" "$(status tml delete-world 'Nope')"
 check "a mod config is written" "0" "$(status tml set-modconfig 'CalamityMod_Server.json' '{"a": 1}')"
 check "and listed" "CalamityMod" "$(tml modconfigs | python3 -c 'import json,sys;print(json.load(sys.stdin)["configs"][0]["mod"])')"
 check "a path is refused" "2" "$(status tml set-modconfig '../x.json' '{}')"
+
+# Worlds by their EXACT file names (1.0.2): a world copied in by hand keeps any character.
+printf x >"${data}/Worlds/Bob's World.wld"; printf x >"${data}/Worlds/Bob's World.twld"
+printf x >"${data}/Worlds/Bob's World.wld.bak"; printf x >"${data}/Worlds/Bob's World 2.wld"
+printf x >"${data}/Worlds/Bobs World.wld"
+check "an existing world with a quote is taken as it is" "0" "$(status tml set-settings "{\"world\": \"Bob's World\"}")"
+tml apply >/dev/null
+check "and loaded by its exact file" "${data}/Worlds/Bob's World.wld" "$(cfgval world)"
+check "with no new world made" "" "$(cfgval autocreate)"
+tml set-settings '{"world": "Other World"}' >/dev/null
+tml apply >/dev/null
+check "deleting a world matches it exactly" '["Bob'"'"'s World.twld", "Bob'"'"'s World.wld", "Bob'"'"'s World.wld.bak"]' "$(tml delete-world "Bob's World" | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["removed"]))')"
+check "a world whose cleaned name is the same is left alone" "0" "$(status test -f "${data}/Worlds/Bobs World.wld")"
+check "and one whose name starts the same" "0" "$(status test -f "${data}/Worlds/Bob's World 2.wld")"
+check "a cleaned-up name is not a world" "2" "$(status tml delete-world 'Bobs World 2')"
+
+# playing: only the answer, between the command and its summary.
+check "chat around the answer is not a player" "Disconnected Dan" "$(py 'print(",".join(p["name"] for p in t.parse_playing("<Bob> brb (10.0.0.1)\n: Disconnected Dan (1.2.3.4:1)\n: 1 player connected.\n<Amy> hi (5.6.7.8)")))')"
+check "no summary, no players" "[]" "$(py 'print(t.parse_playing("Alice (1.2.3.4:5)"))')"
+check "versions from the banner" "('2026.8.3.0', '1.4.4.9')" "$(py 'print(t.game_versions(["Terraria Server v1.4.4.9 - tModLoader v2026.8.3.0"]))')"
+
+# Pending changes: an uploaded or removed .tmod, a mod config, a mark.
+tml apply >/dev/null
+check "nothing pending right after a start" "False" "$(tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+cp "${tmp}/Fake.tmod" "${data}/Mods/Other.tmod"
+check "an uploaded .tmod is pending" "True" "$(tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+tml apply >/dev/null; rm -f "${data}/Mods/Other.tmod"
+check "a removed .tmod is pending" "True" "$(tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+tml apply >/dev/null; tml set-modconfig 'X_Y.json' '{}' >/dev/null
+check "a mod config is pending" "True" "$(tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+tml apply >/dev/null; tml mark-pending 'upload' >/dev/null
+check "a mark is pending" "True" "$(tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+tml apply >/dev/null
+check "and applied by the next start" "False" "$(tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+
+# The same mod twice.
+cp "${tmp}/Fake.tmod" "${data}/Mods/FakeMod-copy.tmod"
+tml set-mods '{"disabled": []}' >/dev/null
+tml sync-mods >"${tmp}/sync"
+check "two copies of one mod are said" "1" "$(grep -c 'two copies of FakeMod' "${tmp}/sync")"
+check "and flagged" "True True" "$(tml mods | python3 -c 'import json,sys;print(" ".join(str(m.get("duplicate")) for m in json.load(sys.stdin)["mods"] if m["name"]=="FakeMod"))')"
+rm -f "${data}/Mods/FakeMod-copy.tmod"
+
+# An empty variable is unset, for every setting.
+tml set-settings '{"maxPlayers": 12}' >/dev/null
+check "an empty TML_MAX_PLAYERS leaves the panel's" "12" "$(tml TML_MAX_PLAYERS= apply >/dev/null; cfgval maxplayers)"
+
+# Backups: a start backup only when the newest is old; the rotation keeps a day's and a week's.
+export FLUX_BACKUP_KEEP=3
+check "a backup" "1" "$(tml backup manual | grep -c 'backup (manual)')"
+check "a start backup right after it is skipped" "1" "$(tml backup start | grep -c 'skipped')"
+check "the backups list" "manual" "$(tml backups | python3 -c 'import json,sys;print(json.load(sys.stdin)["backups"][0]["why"])')"
+check "keep: the newest 2, plus the newest over a day and over a week old" "a b e f" "$(py 'k=t.backups_to_keep([("a",1000000),("b",999000),("c",990000),("d",950000),("e",900000),("f",300000)],2,1000000); print(" ".join(sorted(k)))')"
+unset FLUX_BACKUP_KEEP
+
+# Restore: put back, with a pre-restore backup of what was there.
+printf before >"${data}/Worlds/Other World.wld"
+name="$(tml backups | python3 -c 'import json,sys;print(json.load(sys.stdin)["backups"][0]["name"])')"
+cp "${data}/flux/backups/${name}" "${tmp}/b.tgz"
+printf changed >"${data}/Worlds/Other World.wld"; printf new >"${data}/Worlds/Brand New.wld"
+check "a restore of an unknown backup is refused" "2" "$(status tml restore '../x.tar.gz')"
+check "a restore is asked for (no server: on the next start)" "start" "$(tml restore "${name}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["appliesOn"])')"
+check "and is pending" "True" "$(tml status | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+sleep 1
+tml do-restore >"${tmp}/restore"
+check "the world is back" "x" "$(cat "${data}/Worlds/Other World.wld")"
+check "a world made since is gone with it" "1" "$(status test -f "${data}/Worlds/Brand New.wld")"
+check "what was there is in a pre-restore backup" "pre-restore" "$(tml backups | python3 -c 'import json,sys;print(json.load(sys.stdin)["backups"][0]["why"])')"
+check "the request is done" "1" "$(status test -f "${data}/flux/restore-request.json")"
+
+# Releases without the API: an exact version is its tag; a cache is used; GitHub's "wait" is kept.
+check "an exact version needs no list" "v2026.07.1.0" "$(env -i PATH="${PATH}" FLUX_DATA_DIR="${data}" FLUX_RELEASES_API=http://127.0.0.1:9/ PYTHONPATH=scripts python3 -c 'import fluxtml as t; print(t.latest_release_tag("2026.7.1.0"))')"
+printf '{"at": %s, "releases": [{"tag_name": "v2026.08.3.0", "prerelease": false}]}' "$(date +%s)" >"${data}/flux/releases.json"
+check "a fresh cache answers" "v2026.08.3.0" "$(env -i PATH="${PATH}" FLUX_DATA_DIR="${data}" FLUX_RELEASES_API=http://127.0.0.1:9/ PYTHONPATH=scripts python3 -c 'import fluxtml as t; print(t.latest_release_tag("stable"))')"
+printf '{"at": 1, "backoffUntil": %s, "releases": [{"tag_name": "v2026.08.3.0", "prerelease": false}]}' "$(( $(date +%s) + 600 ))" >"${data}/flux/releases.json"
+check "an old cache is used while GitHub said to wait" "v2026.08.3.0" "$(env -i PATH="${PATH}" FLUX_DATA_DIR="${data}" FLUX_RELEASES_API=http://127.0.0.1:9/ PYTHONPATH=scripts python3 -c 'import fluxtml as t; print(t.latest_release_tag("stable"))')"
+
+# Failed updates are left alone for a while.
+mkdir -p "${tmp}/server/workshop/steamapps/workshop"
+printf '"AppWorkshop"\n{\n\t"WorkshopItemsInstalled"\n\t{\n\t\t"111"\n\t\t{\n\t\t\t"size"\t\t"1"\n\t\t\t"timeupdated"\t\t"100"\n\t\t}\n\t}\n}\n' >"${tmp}/server/workshop/steamapps/workshop/appworkshop_1281930.acf"
+printf '{"targets": ["mod:111:200"]}' >"${data}/flux/update-wanted.json"
+tml sync-mods >"${tmp}/sync"
+check "an update that did not download is remembered" "1" "$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "${data}/flux/update-failed.json")"
+check "and said" "1" "$(grep -c 'did not download' "${tmp}/sync")"
+check "for six hours" "True" "$(env -i PATH="${PATH}" FLUX_DATA_DIR="${data}" FLUX_SERVER_DIR="${tmp}/server" PYTHONPATH=scripts python3 -c 'import fluxtml as t; print("mod:111:200" in t.failed_updates())')"
+check "not after" "False" "$(env -i PATH="${PATH}" FLUX_DATA_DIR="${data}" FLUX_SERVER_DIR="${tmp}/server" PYTHONPATH=scripts python3 -c 'import fluxtml as t, time; print("mod:111:200" in t.failed_updates(time.time() + 7 * 3600))')"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" = "0" ]

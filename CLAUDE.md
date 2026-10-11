@@ -48,3 +48,8 @@ A change to what the image does bumps `VERSION` and gets a line under "Versions"
 - **Clients download the server's mods when they join**; the server's version wins.
 - **The console's answers start with ": "** and arrive on the server's stdout, which is our log.
 - **World evil cannot be chosen by autocreate** (random). Upload a world to choose it.
+- **Worlds are matched by their exact file names** (`existing_world`); `world_stem` only names NEW
+  worlds. A cleaned name must never be used to find or delete a world.
+- **Backups rotate with a floor**: `backups_to_keep` keeps the newest over a day and over a week.
+  Restores are done by the supervisor between generations (`do-restore`), never under the server.
+- **The game's logs are on the install volume** (`flux-logs/`), capped by the watcher.

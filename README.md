@@ -15,15 +15,18 @@ the image, and a supervisor that:
   SIGTERM) and every `TML_AUTOSAVE_MINUTES`
 - follows a newer tModLoader and mod updates on the Workshop: warns the players in chat for 5
   minutes (skipped on an empty server), then restarts onto them; `TML_RESTART_TIME` = a daily one
-- makes a backup of the worlds, mod configs and settings on every start and every 6 hours
+- makes a backup of the worlds, mod configs and settings every 6 hours and on a start (unless the
+  newest is under an hour old); keeps the newest 10 AND the newest over a day and over a week old,
+  so a crash loop can never rotate every good backup away; restores one on the panel's request
+- leaves an update that could not be installed alone for 6 hours (no restart loop)
 - gives the hub a console (`flux-console`) and JSON commands (`flux-tml`)
 
 ## Volumes
 
 | Path | Flux mount | What |
 |---|---|---|
-| `/mnt/tml/data` | `g:` (synced) | the tModLoader save directory: `Worlds/` (`.wld` + `.twld`, and their `.bak`), `Mods/` (`enabled.json`, uploaded `.tmod`), `ModConfigs/`, `banlist.txt`, and `flux/` (log, state, settings, mods list, backups, the game's logs) |
-| `/mnt/tml/server` | `ml:server` (local) | the tModLoader build (~170 MB) and the Workshop downloads (Calamity and its music: ~1.1 GB). Downloaded again on a new node |
+| `/mnt/tml/data` | `g:` (synced) | the tModLoader save directory: `Worlds/` (`.wld` + `.twld`, and their `.bak`), `Mods/` (`enabled.json`, uploaded `.tmod`), `ModConfigs/`, `banlist.txt`, and `flux/` (log, state, settings, mods list, backups) |
+| `/mnt/tml/server` | `ml:server` (local) | the tModLoader build (~170 MB) and the Workshop downloads (Calamity and its music: ~1.1 GB) and the game's console logs (`flux-logs/`, 20 MB each, the newest 10). Downloaded again on a new node |
 
 Spec: `g:/mnt/tml/data|ml:server:/mnt/tml/server`.
 
@@ -37,7 +40,9 @@ server through its console.
 A variable that is **set** is applied on every start; one that is not set leaves the panel's
 value (`flux/settings.json`), and then the default. Two exceptions: the size, difficulty and seed of
 a **new** world, where the panel's New World choice wins (the variables are the default); and an
-**empty** `TML_MOTD`, `TML_PASSWORD` or `TML_SEED`, which counts as unset.
+**empty** variable, which counts as unset for every setting (the marketplace writes the declared ones
+even when left blank). A world that is there is loaded by its exact file name; only a new one gets a
+cleaned-up name.
 
 | Variable | | |
 |---|---|---|
@@ -58,9 +63,12 @@ a **new** world, where the panel's New World choice wins (the variables are the 
 The world's evil (Corruption/Crimson) cannot be chosen by a server that creates the world: it is
 random. A world made in the game and uploaded keeps its own.
 
-Supervisor knobs: `FLUX_BACKUP_HOURS` (6), `FLUX_BACKUP_KEEP` (5), `FLUX_UPDATE_CHECK_MINUTES` (60,
-0 = off), `FLUX_WARN_MINUTES` (5), `FLUX_RESTART_MAX_ATTEMPTS` (5 in `FLUX_RESTART_WINDOW` 3600 s,
-then exit 42).
+Supervisor knobs: `FLUX_BACKUP_HOURS` (6), `FLUX_BACKUP_KEEP` (10), `FLUX_BACKUP_MIN_AGE_MINUTES`
+(60), `FLUX_UPDATE_CHECK_MINUTES` (60, 0 = off), `FLUX_UPDATE_RETRY_HOURS` (6), `FLUX_WARN_MINUTES`
+(5), `FLUX_GAME_LOG_MAX_BYTES` (20 MB), `FLUX_RESTART_MAX_ATTEMPTS` (5 in `FLUX_RESTART_WINDOW`
+3600 s, then exit 42), `GITHUB_TOKEN` (optional: GitHub's API allows 60 requests an hour per address
+without one; the release list is cached an hour on the data volume, GitHub's "wait" is honoured,
+an exact `TML_VERSION` needs no lookup, and `stable` falls back on the /releases/latest redirect).
 
 ## For the hub
 
@@ -75,6 +83,8 @@ then exit 42).
 | `flux-tml modconfigs` / `set-modconfig <file> '<json>'` | the mods' config files |
 | `flux-tml bans` / `unban <name or IP>` | `banlist.txt` |
 | `flux-tml restart` | save and start again in place (applies the above) |
+| `flux-tml backups` / `restore <name>` | the backups (name, size, time, why); a restore: saved and stopped, what is there now backed up ("pre-restore"), the backup put back, started again. Asked for while the server is down, it is done on the next start |
+| `flux-tml mark-pending <what>` | the panel changed a file on the volume itself (an upload): `status.pending` says a restart applies it |
 
 ## Measured (tModLoader v2026.08.3.0, Terraria 1.4.4.9)
 
@@ -89,6 +99,17 @@ then exit 42).
   cached for a day.
 
 ## Versions
+
+- **1.0.2** (2026-10-11): worlds by their exact file names (a world copied in by hand was loaded as a
+  new empty one, and deleting by a cleaned name could hit another world); `playing` read only between
+  the command and its summary (chat lines were taken for players); `pending` also for uploaded,
+  removed or replaced .tmod files and mod configs; the Terraria version read from the game's banner;
+  two copies of one mod flagged; backups: a start one only when the newest is over an hour old, the
+  newest over a day and over a week always kept, `backups`/`restore`; an update that failed to
+  install is not retried for 6 h; the release list cached with GitHub's rate limits honoured,
+  `GITHUB_TOKEN`, /releases/latest and exact tags without the API; the game's logs on the install
+  volume and capped at 20 MB; an empty variable is unset for every setting; status reads the log's
+  head and tail, never the whole file.
 
 - **1.0.1** (2026-10-11): a new world made from the panel keeps its own size, difficulty and seed
   (the spec's variables are the default); an empty MOTD, password or seed variable no longer
