@@ -6,7 +6,11 @@
 # that resolves the mods' dependencies, writes serverconfig.txt from the environment and the hub's
 # panel, saves on stop and on a timer, follows tModLoader and mod updates with warnings in chat,
 # keeps backups, and gives the hub a console and JSON status. See README.md.
-FROM steamcmd/steamcmd:ubuntu-24
+# The base. CI builds it pinned to the digest it resolved and records that digest in the
+# org.opencontainers.image.base.digest label, which the scheduled check compares against
+# (.github/ci/needs-rebuild.sh).
+ARG BASE_IMAGE=steamcmd/steamcmd:ubuntu-24
+FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG FLUX_IMAGE_VERSION=dev
