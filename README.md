@@ -100,6 +100,11 @@ an exact `TML_VERSION` needs no lookup, and `stable` falls back on the /releases
 
 ## Versions
 
+- **1.0.3** (2026-10-16): the image applies Ubuntu's pending updates when it is built (`apt-get
+  upgrade`), so a rebuild clears what the published image was missing; the base is pinned to the
+  digest the build resolved and recorded in `org.opencontainers.image.base.digest`. The scheduled
+  CI run publishes only when something is waiting (an urgent security update now, anything else
+  on the first Monday of the month), since every new `:latest` restarts every server.
 - **1.0.2** (2026-10-11): worlds by their exact file names (a world copied in by hand was loaded as a
   new empty one, and deleting by a cleaned name could hit another world); `playing` read only between
   the command and its summary (chat lines were taken for players); `pending` also for uploaded,

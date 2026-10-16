@@ -19,6 +19,7 @@ ARG FLUX_IMAGE_VERSION=dev
 # package pulls libicu in (.NET fails without ICU). python3, NOT python3-minimal: fluxtml.py
 # needs json, zipfile and urllib.
 RUN apt-get update -y && \
+    apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl procps tzdata python3 dotnet-runtime-8.0 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
